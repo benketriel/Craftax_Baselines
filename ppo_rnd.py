@@ -179,6 +179,9 @@ def make_train(config):
                 obsv, env_state, reward_e, done, info = env.step(
                     _rng, env_state, action, env_params
                 )
+                if not config["SUPERVISED"]:
+                    reward_e = reward_e * 0
+
 
                 reward_i = jnp.zeros(config["NUM_ENVS"])
 
@@ -616,7 +619,11 @@ def run_ppo(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
+    # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
+    parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
+    parser.add_argument(
+        "--supervised", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument(
         "--num_envs",
         type=int,

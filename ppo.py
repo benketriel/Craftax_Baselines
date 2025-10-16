@@ -667,7 +667,8 @@ def run_ppo(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
+    parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
+    # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
     parser.add_argument(
         "--num_envs",
         type=int,

@@ -6,6 +6,8 @@ from typing import Sequence
 
 import distrax
 
+from models.alt_activations import get_activation
+
 
 class ActorCriticConvSymbolicCraftax(nn.Module):
     action_dim: Sequence[int]
@@ -83,18 +85,20 @@ class ActorCriticConvSymbolicCraftax(nn.Module):
 class ActorCriticConv(nn.Module):
     action_dim: Sequence[int]
     layer_width: int
-    activation: str = "tanh"
+    activation: str = "relog"
 
     @nn.compact
     def __call__(self, obs):
+        activation = get_activation(self.activation)
+
         x = nn.Conv(features=32, kernel_size=(5, 5))(obs)
-        x = nn.relu(x)
+        x = activation(x)
         x = nn.max_pool(x, window_shape=(3, 3), strides=(3, 3))
         x = nn.Conv(features=32, kernel_size=(5, 5))(x)
-        x = nn.relu(x)
+        x = activation(x)
         x = nn.max_pool(x, window_shape=(3, 3), strides=(3, 3))
         x = nn.Conv(features=32, kernel_size=(5, 5))(x)
-        x = nn.relu(x)
+        x = activation(x)
         x = nn.max_pool(x, window_shape=(3, 3), strides=(3, 3))
 
         embedding = x.reshape(x.shape[0], -1)
@@ -102,12 +106,12 @@ class ActorCriticConv(nn.Module):
         actor_mean = nn.Dense(
             self.layer_width, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(embedding)
-        actor_mean = nn.relu(actor_mean)
+        actor_mean = activation(actor_mean)
 
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)
-        actor_mean = nn.relu(actor_mean)
+        actor_mean = activation(actor_mean)
 
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
@@ -118,7 +122,7 @@ class ActorCriticConv(nn.Module):
         critic = nn.Dense(
             self.layer_width, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(embedding)
-        critic = nn.relu(critic)
+        critic = activation(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -129,14 +133,11 @@ class ActorCriticConv(nn.Module):
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     layer_width: int
-    activation: str = "tanh"
+    activation: str = "relog"
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
+        activation = get_activation(self.activation)
 
         actor_mean = nn.Dense(
             self.layer_width,
@@ -199,10 +200,7 @@ class ActorCriticWithEmbedding(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        if self.activation == "relu":
-            activation = nn.relu
-        else:
-            activation = nn.tanh
+        activation = get_activation(self.activation)
 
         actor_emb = nn.Dense(
             self.layer_width,
