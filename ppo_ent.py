@@ -785,7 +785,7 @@ if __name__ == "__main__":
     # parser.add_argument("--ent_grid_w", type=int, default=11)
     parser.add_argument("--ent_rest_out", type=int, default=32)
     parser.add_argument("--ent_histogram_bins", type=int, default=151)
-    parser.add_argument("--ent_bin_width", type=float, default=0.03)
+    parser.add_argument("--ent_bin_width", type=float, default=0.01)
     parser.add_argument("--ent_min_count", type=float, default=0.01)
     parser.add_argument("--ent_decay", type=float, default=0.99)
 
