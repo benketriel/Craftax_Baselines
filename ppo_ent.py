@@ -769,10 +769,10 @@ if __name__ == "__main__":
     # EXPLORATION
     parser.add_argument("--exploration_update_epochs", type=int, default=4)
     # ENT
-    parser.add_argument("--ent_reward_coeff", type=float, default=1)
+    parser.add_argument("--ent_reward_coeff", type=float, default=1e-2)
     parser.add_argument("--ent_lr", type=float, default=1.5e-3)
     parser.add_argument("--ent_layer_size", type=int, default=256)  # 256 did better than 128
-    parser.add_argument("--ent_num_layers", type=int, default=6)  # Might need 6 for better results?
+    parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results?
     # Classic
     parser.add_argument("--ent_tile_in", type=int, default=21)
     parser.add_argument("--ent_tile_out", type=int, default=16)
