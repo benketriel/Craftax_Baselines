@@ -218,6 +218,9 @@ def make_train(config):
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
+                # import distrax
+                # pi = distrax.Categorical(logits=pi.logits * 0 + (1 / pi.logits.shape[-1]))
+
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
@@ -226,6 +229,8 @@ def make_train(config):
                 obsv, env_state, reward_e, done, info = env.step(
                     _rng, env_state, action, env_params
                 )
+                if not config["SUPERVISED"]:
+                    reward_e = reward_e * 0
 
                 reward_i = jnp.zeros(config["NUM_ENVS"])
 
@@ -670,6 +675,9 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
     # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
     parser.add_argument(
+        "--supervised", action=argparse.BooleanOptionalAction, default=True and False
+    )
+    parser.add_argument(
         "--num_envs",
         type=int,
         default=1024,
@@ -722,7 +730,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_e3b", action="store_true")
     parser.add_argument("--e3b_lambda", type=float, default=0.1)
 
-    args, rest_args = parser.parse_known_args(sys.argv[1:])
+    args, rest_args = parser.parse_known_args(["--train_icm"])
+    # args, rest_args = parser.parse_known_args(sys.argv[1:])
     if rest_args:
         raise ValueError(f"Unknown args {rest_args}")
 

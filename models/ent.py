@@ -28,7 +28,7 @@ class ENTEncoderTiled(nn.Module):
     num_layers: int
     activation: str = "relog"
 
-    grid_h: int = 7
+    grid_h: int = 7 # Classic
     grid_w: int = 9
     tile_in: int = 21
     tile_out: int = 10

@@ -85,7 +85,8 @@ def _save_reconstruction_strips_host(
     step_int,
     seed,
     out_dir,
-    pixels_per_row=9*7,
+    # pixels_per_row=9*7, # 11*9
+    # pixels_per_row=90,
     upscale=2,
     title_prefix="ENT Recon Strips",
 ):
@@ -126,6 +127,7 @@ def _save_reconstruction_strips_host(
         r_rgb = (r.reshape(-1, 3) * 255.0).clip(0, 255).astype(np.uint8)
 
         num_pixels = o_rgb.shape[0]
+        pixels_per_row = math.ceil(math.sqrt(num_pixels) * 2)
         rows_needed = math.ceil(num_pixels / pixels_per_row)
         total_pixels = rows_needed * pixels_per_row
 
@@ -256,16 +258,22 @@ def make_train(config):
             # ex_state["latent_histogram"] = jnp.zeros((config["ENT_LATENT_SIZE"], config["ENT_HISTOGRAM_BINS"]), dtype=jnp.float32)
 
             # Encoder tiled
-            icm_encoder_network = ENTEncoderTiled(num_layers=config["ENT_NUM_LAYERS"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], layer_size=config["ENT_LAYER_SIZE"], )
+            icm_encoder_network = ENTEncoderTiled(num_layers=config["ENT_NUM_LAYERS"], 
+                                                  tile_in=config["ENT_TILE_IN"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], 
+                                                  grid_h=config["ENT_GRID_H"], grid_w=config["ENT_GRID_W"],
+                                                  layer_size=config["ENT_LAYER_SIZE"], )
             rng, _rng = jax.random.split(rng)
             icm_encoder_network_params = icm_encoder_network.init(_rng, jnp.zeros((1, obs_shape)))
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["ENT_LR"], eps=1e-5),)
             ex_state["ent_encoder"] = TrainState.create(apply_fn=icm_encoder_network.apply, params=icm_encoder_network_params, tx=tx,)
 
-            latent_size = config["ENT_TILE_OUT"] * 7 * 9 + config["ENT_REST_OUT"]
+            latent_size = config["ENT_TILE_OUT"] * config["ENT_GRID_H"] * config["ENT_GRID_W"] + config["ENT_REST_OUT"]
 
             # Decoder tiled
-            icm_forward_network = ENTDecoderTiled(num_layers=config["ENT_NUM_LAYERS"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], output_dim=obs_shape, layer_size=config["ENT_LAYER_SIZE"])
+            icm_forward_network = ENTDecoderTiled(num_layers=config["ENT_NUM_LAYERS"], 
+                                                  tile_in=config["ENT_TILE_IN"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], 
+                                                  grid_h=config["ENT_GRID_H"], grid_w=config["ENT_GRID_W"],
+                                                  output_dim=obs_shape, layer_size=config["ENT_LAYER_SIZE"])
             rng, _rng = jax.random.split(rng)
             icm_forward_network_params = icm_forward_network.init(_rng, jnp.zeros((1, latent_size)))
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["ENT_LR"], eps=1e-5), )
@@ -359,7 +367,7 @@ def make_train(config):
                     # counts/ex_state["latent_histogram"]: (L2, K) where L2 = tile_out + rest_out
 
                     # Constants (make sure these are Python ints for good XLA specialization)
-                    tile_mult = 7 * 9
+                    tile_mult = config["ENT_GRID_H"] * config["ENT_GRID_W"]
                     tile_out  = config["ENT_TILE_OUT"]
                     rest_out  = config["ENT_REST_OUT"]
                     B         = latent_obs.shape[0]
@@ -450,7 +458,8 @@ def make_train(config):
                     ex_state["latent_histogram"] = new_counts
 
 
-
+                if config['CONSTANT_REWARD'] > 0:
+                    reward_i += config['CONSTANT_REWARD']
 
                 reward = reward_e + reward_i
 
@@ -711,20 +720,22 @@ def run_ppo(config):
 
 
 if __name__ == "__main__":
+    # for _ in range(10):
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_wandb", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--wandb_suffix", type=str, default="sup-ent")
+    parser.add_argument("--wandb_suffix", type=str, default="ent")
+    parser.add_argument("--train_ent", action=argparse.BooleanOptionalAction, default=False or True)
+    parser.add_argument("--constant_reward", type=float, default=0.05 * 0)
 
     # Their originals:
     # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
     parser.add_argument("--total_timesteps", type=lambda x: int(float(x)), default=1e9)  # Allow scientific notation
-    parser.add_argument("--num_envs", type=int, default=1024)
+    parser.add_argument("--num_envs", type=int, default=1024) # //4
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num_steps", type=int, default=64)
+    parser.add_argument("--num_steps", type=int, default=64) #  * 4
     parser.add_argument("--update_epochs", type=int, default=4)
     # parser.add_argument("--supervised", action=argparse.BooleanOptionalAction, default=True)
-    # parser.add_argument("--train_ent", action=argparse.BooleanOptionalAction, default=False)
 
     # Crafter hyperparams:
     parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
@@ -735,16 +746,15 @@ if __name__ == "__main__":
     # parser.add_argument("--num_steps", type=int, default=512)
     # parser.add_argument("--update_epochs", type=int, default=3)
     parser.add_argument("--supervised", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--train_ent", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--num_minibatches", type=int, default=8)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.8)
+    parser.add_argument("--gae_lambda", type=float, default=0.8 * 0 + 0.99)
     parser.add_argument("--clip_eps", type=float, default=0.2)
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--activation", type=str, default="tanh")
+    # parser.add_argument("--activation", type=str, default="tanh")  # Not used
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--jit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int)
@@ -759,14 +769,23 @@ if __name__ == "__main__":
     # EXPLORATION
     parser.add_argument("--exploration_update_epochs", type=int, default=4)
     # ENT
-    parser.add_argument("--ent_reward_coeff", type=float, default=0.00001)
+    parser.add_argument("--ent_reward_coeff", type=float, default=1)
     parser.add_argument("--ent_lr", type=float, default=1.5e-3)
-    parser.add_argument("--ent_layer_size", type=int, default=128)  # Might need to use 256 for better results
+    parser.add_argument("--ent_layer_size", type=int, default=256)  # Might need to use 256 for better results
     parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results
-    parser.add_argument("--ent_tile_out", type=int, default=16)
+    # Classic
+    parser.add_argument("--ent_tile_in", type=int, default=21)
+    parser.add_argument("--ent_tile_out", type=int, default=10)
+    parser.add_argument("--ent_grid_h", type=int, default=7)
+    parser.add_argument("--ent_grid_w", type=int, default=9)
+    # Craftax
+    # parser.add_argument("--ent_tile_in", type=int, default=83)
+    # parser.add_argument("--ent_tile_out", type=int, default=32)
+    # parser.add_argument("--ent_grid_h", type=int, default=9)
+    # parser.add_argument("--ent_grid_w", type=int, default=11)
     parser.add_argument("--ent_rest_out", type=int, default=32)
     parser.add_argument("--ent_histogram_bins", type=int, default=151)
-    parser.add_argument("--ent_bin_width", type=float, default=0.01)
+    parser.add_argument("--ent_bin_width", type=float, default=0.03)
     parser.add_argument("--ent_min_count", type=float, default=0.01)
     parser.add_argument("--ent_decay", type=float, default=0.99)
 

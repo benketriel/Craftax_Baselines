@@ -27,7 +27,7 @@ from wrappers import (
     AutoResetEnvWrapper,
     BatchEnvWrapper,
 )
-from models.rnd import RNDNetwork, ActorCriticRND
+from models.rnd import RNDNetwork, ActorCriticRND, ActorCriticRNDTiled
 
 # Code adapted from the original implementation made by Chris Lu
 # Original code located at https://github.com/luchris429/purejaxrl
@@ -82,17 +82,25 @@ def make_train(config):
     def train(rng):
         # INIT NETWORK
         if "Symbolic" in config["ENV_NAME"]:
-            network = ActorCriticRND(
+            # network = ActorCriticRND(
+            #     env.action_space(env_params).n, config["LAYER_SIZE"]
+            # )
+            network = ActorCriticRNDTiled(
                 env.action_space(env_params).n, config["LAYER_SIZE"]
             )
         else:
-            raise ValueError
+            # raise ValueError
+            network = ActorCriticRND(
+                env.action_space(env_params).n, config["LAYER_SIZE"]
+            )
             # network = ActorCriticConv(
             #     env.action_space(env_params).n, config["LAYER_SIZE"]
             # )
 
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+        if len(init_x.shape) > 2:
+            init_x = init_x.reshape((1, -1))
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
             tx = optax.chain(
@@ -117,8 +125,11 @@ def make_train(config):
 
         if config["USE_RND"]:
             obs_shape = env.observation_space(env_params).shape
-            assert len(obs_shape) == 1, "Only configured for 1D observations"
-            obs_shape = obs_shape[0]
+            # assert len(obs_shape) == 1, "Only configured for 1D observations"
+            if len(obs_shape) > 1:
+                obs_shape = np.prod(obs_shape)
+            else:
+                obs_shape = obs_shape[0]
 
             # Random network
             rnd_random_network = RNDNetwork(
@@ -154,6 +165,8 @@ def make_train(config):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         obsv, env_state = env.reset(_rng, env_params)
+        if len(obsv.shape) > 2:
+            obsv = obsv.reshape((obsv.shape[0], -1))
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -179,6 +192,9 @@ def make_train(config):
                 obsv, env_state, reward_e, done, info = env.step(
                     _rng, env_state, action, env_params
                 )
+                if len(obsv.shape) > 2:
+                    obsv = obsv.reshape((obsv.shape[0], -1))
+
                 if not config["SUPERVISED"]:
                     reward_e = reward_e * 0
 
@@ -621,8 +637,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
     parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
+    # parser.add_argument("--env_name", type=str, default="Craftax-Classic-Pixels-v1")
     parser.add_argument(
-        "--supervised", action=argparse.BooleanOptionalAction, default=True
+        "--supervised", action=argparse.BooleanOptionalAction, default=True and False
     )
     parser.add_argument(
         "--num_envs",
@@ -650,7 +667,7 @@ if __name__ == "__main__":
     parser.add_argument("--jit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
-        "--use_wandb", action=argparse.BooleanOptionalAction, default=True
+        "--use_wandb", action=argparse.BooleanOptionalAction, default=True #and False
     )
     parser.add_argument("--save_policy", action="store_true")
     parser.add_argument("--num_repeats", type=int, default=1)
