@@ -749,7 +749,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--num_minibatches", type=int, default=8)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.8 * 0 + 0.99)
+    parser.add_argument("--gae_lambda", type=float, default=0.8) # * 0 + 0.99)
     parser.add_argument("--clip_eps", type=float, default=0.2)
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--vf_coef", type=float, default=0.5)
@@ -772,10 +772,10 @@ if __name__ == "__main__":
     parser.add_argument("--ent_reward_coeff", type=float, default=1)
     parser.add_argument("--ent_lr", type=float, default=1.5e-3)
     parser.add_argument("--ent_layer_size", type=int, default=256)  # 256 did better than 128
-    parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results?
+    parser.add_argument("--ent_num_layers", type=int, default=6)  # Might need 6 for better results?
     # Classic
     parser.add_argument("--ent_tile_in", type=int, default=21)
-    parser.add_argument("--ent_tile_out", type=int, default=10)
+    parser.add_argument("--ent_tile_out", type=int, default=16)
     parser.add_argument("--ent_grid_h", type=int, default=7)
     parser.add_argument("--ent_grid_w", type=int, default=9)
     # Craftax
