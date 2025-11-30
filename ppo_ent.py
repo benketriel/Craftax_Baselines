@@ -730,10 +730,10 @@ if __name__ == "__main__":
     # Their originals:
     # parser.add_argument("--env_name", type=str, default="Craftax-Symbolic-v1")
     parser.add_argument("--total_timesteps", type=lambda x: int(float(x)), default=1e9)  # Allow scientific notation
-    parser.add_argument("--num_envs", type=int, default=1024) # //4
+    parser.add_argument("--num_envs", type=int, default=1024) # //4  # Just dividing by 4 here was worse (no other corrections)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--num_steps", type=int, default=64) #  * 4
+    parser.add_argument("--num_steps", type=int, default=64) #  # Just dividing by 4 here was worse (no other corrections)
     parser.add_argument("--update_epochs", type=int, default=4)
     # parser.add_argument("--supervised", action=argparse.BooleanOptionalAction, default=True)
 
@@ -771,8 +771,8 @@ if __name__ == "__main__":
     # ENT
     parser.add_argument("--ent_reward_coeff", type=float, default=1)
     parser.add_argument("--ent_lr", type=float, default=1.5e-3)
-    parser.add_argument("--ent_layer_size", type=int, default=256)  # Might need to use 256 for better results
-    parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results
+    parser.add_argument("--ent_layer_size", type=int, default=256)  # 256 did better than 128
+    parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results?
     # Classic
     parser.add_argument("--ent_tile_in", type=int, default=21)
     parser.add_argument("--ent_tile_out", type=int, default=10)
