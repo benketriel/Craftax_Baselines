@@ -858,7 +858,9 @@ if __name__ == "__main__":
     parser.add_argument("--ent_dump_every", type=int, default=1000)   # save every N PPO updates
     parser.add_argument("--ent_dump_dir", type=str, default="tmp")   # output root dir
 
-    args, rest_args = parser.parse_known_args(sys.argv[1:])
+    # args, rest_args = parser.parse_known_args(sys.argv[1:])
+    args, rest_args = parser.parse_known_args(['--seed', '1606263617'])  # Gets diamonds unsupervised
+    
     if rest_args:
         raise ValueError(f"Unknown args {rest_args}")
 
