@@ -12,6 +12,7 @@ import optax
 import matplotlib.pyplot as plt
 
 from craftax.craftax_env import make_craftax_env_from_name
+import distrax
 
 import wandb
 from typing import NamedTuple
@@ -185,9 +186,59 @@ def _save_reconstruction_strips_host(
     img.save(path, format="PNG")
 
 
+def _log_action_and_value_stats_host(actions, value_env, value_norm, step_scalar):
+    """
+    Host-side debug logger for PPO.
+    Called via jax.debug.callback inside the JIT.
+    - actions: (T, B) or (T, B, ...) JAX array of int actions
+    - value_env: same shape as actions, float
+    - value_norm: same shape as actions, float
+    - step_scalar: scalar PPO update index
+    """
+    step = int(step_scalar)
+
+    log_path = os.path.join('tmp', f"action_value_stats.txt")
+
+    actions_np = np.array(actions).reshape(-1)
+    value_env_np = np.array(value_env).reshape(-1)
+    value_norm_np = np.array(value_norm).reshape(-1)
+
+    # Histogram over actions
+    num_actions = 17 # Crafter
+    counts = np.bincount(actions_np, minlength=num_actions)
+    total = counts.sum() + 1e-8
+    probs = counts / total
+
+    # Value stats
+    def _stats(x):
+        if x.size == 0:
+            return {"mean": np.nan, "std": np.nan, "min": np.nan, "max": np.nan}
+        return {
+            "mean": float(x.mean()),
+            "std": float(x.std()),
+            "min": float(x.min()),
+            "max": float(x.max()),
+        }
+
+    stats_env = _stats(value_env_np)
+    stats_norm = _stats(value_norm_np)
+
+    # Append a simple log line (human-readable)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"=== PPO update {step} ===\n")
+        f.write(f"action_counts: {counts.tolist()}\n")
+        f.write(f"action_probs:  {probs.tolist()}\n")
+        f.write(f"value_env: mean={stats_env['mean']:.4f}, std={stats_env['std']:.4f}, "
+                f"min={stats_env['min']:.4f}, max={stats_env['max']:.4f}\n")
+        f.write(f"value_norm: mean={stats_norm['mean']:.4f}, std={stats_norm['std']:.4f}, "
+                f"min={stats_norm['min']:.4f}, max={stats_norm['max']:.4f}\n")
+        f.write("\n")
+
+
 def make_train(config):
     config["NUM_UPDATES"] = (config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     config["MINIBATCH_SIZE"] = (config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"])
+    per_neuron = False
 
     env = make_craftax_env_from_name(config["ENV_NAME"], not config["USE_OPTIMISTIC_RESETS"])
     env_params = env.default_params
@@ -261,7 +312,7 @@ def make_train(config):
             icm_encoder_network = ENTEncoderTiled(num_layers=config["ENT_NUM_LAYERS"], 
                                                   tile_in=config["ENT_TILE_IN"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], 
                                                   grid_h=config["ENT_GRID_H"], grid_w=config["ENT_GRID_W"],
-                                                  layer_size=config["ENT_LAYER_SIZE"], )
+                                                  layer_size=config["ENT_LAYER_SIZE"], activation=config["ACTIVATION"])
             rng, _rng = jax.random.split(rng)
             icm_encoder_network_params = icm_encoder_network.init(_rng, jnp.zeros((1, obs_shape)))
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["ENT_LR"], eps=1e-5),)
@@ -273,13 +324,17 @@ def make_train(config):
             icm_forward_network = ENTDecoderTiled(num_layers=config["ENT_NUM_LAYERS"], 
                                                   tile_in=config["ENT_TILE_IN"], tile_out=config["ENT_TILE_OUT"], rest_out=config["ENT_REST_OUT"], 
                                                   grid_h=config["ENT_GRID_H"], grid_w=config["ENT_GRID_W"],
-                                                  output_dim=obs_shape, layer_size=config["ENT_LAYER_SIZE"])
+                                                  output_dim=obs_shape, layer_size=config["ENT_LAYER_SIZE"], activation=config["ACTIVATION"])
             rng, _rng = jax.random.split(rng)
             icm_forward_network_params = icm_forward_network.init(_rng, jnp.zeros((1, latent_size)))
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["ENT_LR"], eps=1e-5), )
             ex_state["ent_decoder"] = TrainState.create(apply_fn=icm_forward_network.apply, params=icm_forward_network_params, tx=tx, )
-
-            ex_state["latent_histogram"] = jnp.zeros((config["ENT_TILE_OUT"] + config["ENT_REST_OUT"], config["ENT_HISTOGRAM_BINS"]), dtype=jnp.float32)
+            
+            min_count = config["ENT_MIN_COUNT"]
+            if per_neuron:
+                ex_state["latent_histogram"] = jnp.ones((latent_size, config["ENT_HISTOGRAM_BINS"]), dtype=jnp.float32) * min_count
+            else:
+                ex_state["latent_histogram"] = jnp.ones((config["ENT_TILE_OUT"] + config["ENT_REST_OUT"], config["ENT_HISTOGRAM_BINS"]), dtype=jnp.float32) * min_count
             
         ex_state["ewma_return_norm"] = ewma_init()
 
@@ -297,10 +352,12 @@ def make_train(config):
                 rng, _rng = jax.random.split(rng)
                 pi, value_norm = network.apply(train_state.params, last_obs)
 
-                # Force fully random actions:
-                # import distrax
-                # pi = distrax.Categorical(logits=pi.logits * 0 + (1 / pi.logits.shape[-1]))
-
+                # Force random actions
+                # num_actions = pi.logits.shape[-1]
+                # uniform_logit = jnp.log(1.0 / num_actions)
+                # uniform_logits = jnp.full_like(pi.logits, uniform_logit)
+                # pi = distrax.Categorical(logits=uniform_logits)
+                
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 value_env = ewma_denormalize(ex_state["ewma_return_norm"], value_norm)
@@ -320,151 +377,144 @@ def make_train(config):
                     min_count = config["ENT_MIN_COUNT"]
                     decay = config["ENT_DECAY"]
                     ent_scale = config["ENT_REWARD_COEFF"]
+                    # ent_scale_ramp_steps = config["ENT_REWARD_SCALE_RAMP_STEPS"]
 
+                    # ent_scale = ent_scale * jnp.minimum(1.0, update_step / ent_scale_ramp_steps)
 
-                    # Fast, per neuron histogram
-                    # # latent_obs: (B, L)
-                    # # Map activations to bin indices
-                    # z = jnp.round(latent_obs / bin_width).astype(jnp.int32) + nbins // 2
-                    # z = jnp.clip(z, 0, nbins - 1)  # (B, L)
+                    if config["ACTIVATION"] == "tanh":
+                        bin_width = 2.0 / nbins
 
-                    # # Shared counts (L, K)
-                    # counts = ex_state["latent_histogram"]  # (L, K)
+                    if per_neuron:
+                        # Fast, per neuron histogram
+                        # latent_obs: (B, L)
+                        # Map activations to bin indices
+                        z = jnp.round(latent_obs / bin_width).astype(jnp.int32) + nbins // 2
+                        z = jnp.clip(z, 0, nbins - 1)  # (B, L)
 
-                    # # ----- log-density BEFORE updating (avoid bias) -----
-                    # # log_p[l, k] = log(count + min) - log(sum_k count + min*nbins)
-                    # log_p = jnp.log(counts + min_count) - jnp.log(jnp.sum(counts, axis=-1, keepdims=True) + min_count * nbins)  # (L, K)
+                        # Shared counts (L, K)
+                        counts = ex_state["latent_histogram"]  # (L, K)
 
-                    # # Gather log-prob at bins z for each env & latent:
-                    # # Broadcast (L, K) -> (B, L, K), then take along bin axis
-                    # log_p_b = jnp.broadcast_to(log_p, (z.shape[0],) + log_p.shape)  # (B, L, K)
-                    # log_p_sel = jnp.take_along_axis(log_p_b, z[..., None], axis=-1)[..., 0]  # (B, L)
+                        # ----- log-density BEFORE updating (avoid bias) -----
+                        # log_p[l, k] = log(count + min) - log(sum_k count + min*nbins)
+                        log_p = jnp.log(counts + min_count) - jnp.log(jnp.sum(counts, axis=-1, keepdims=True) + min_count * nbins)  # (L, K)
 
-                    # # Intrinsic reward per env (B,)
-                    # reward_i = -jnp.sum(log_p_sel, axis=-1) * ent_scale
+                        # Gather log-prob at bins z for each env & latent:
+                        # Broadcast (L, K) -> (B, L, K), then take along bin axis
+                        log_p_b = jnp.broadcast_to(log_p, (z.shape[0],) + log_p.shape)  # (B, L, K)
+                        log_p_sel = jnp.take_along_axis(log_p_b, z[..., None], axis=-1)[..., 0]  # (B, L)
 
-                    # # ----- build batch increments (B, L, K) -----
-                    # incr_b = jax.nn.one_hot(z, nbins, dtype=jnp.float32)  # (B, L, K)
+                        # Intrinsic reward per env (B,)
+                        reward_i = -jnp.sum(log_p_sel, axis=-1) * ent_scale
 
-                    # # Do not add to edge bins - let outliers be lowest possible density
-                    # edge_mask = jnp.ones((nbins,), dtype=jnp.float32).at[0].set(0.0).at[nbins - 1].set(0.0)
-                    # incr_b = incr_b * edge_mask  # broadcast over (B, L, K)
+                        # ----- build batch increments (B, L, K) -----
+                        incr_b = jax.nn.one_hot(z, nbins, dtype=jnp.float32)  # (B, L, K)
 
-                    # # Aggregate over batch and apply decay once to the shared histogram
-                    # incr = jnp.sum(incr_b, axis=0)  # (L, K)
-                    # new_counts = counts * decay + incr  # (L, K)
+                        # Do not add to edge bins - let outliers be lowest possible density
+                        edge_mask = jnp.ones((nbins,), dtype=jnp.float32).at[0].set(0.0).at[nbins - 1].set(0.0)
+                        incr_b = incr_b * edge_mask  # broadcast over (B, L, K)
 
-                    # # Write back
-                    # ex_state["latent_histogram"] = new_counts
+                        # Aggregate over batch and apply decay once to the shared histogram
+                        incr = jnp.sum(incr_b, axis=0)  # (L, K)
+                        new_counts = counts * decay + incr  # (L, K)
 
+                        # Write back
+                        ex_state["latent_histogram"] = new_counts
 
-
-
-                    # Slow, convolutional/tiled aggregation histogram
-
-                    # Shapes:
-                    # latent_obs: (B, L) where L = tile_out * 63 + rest_out
-                    # counts/ex_state["latent_histogram"]: (L2, K) where L2 = tile_out + rest_out
-
-                    # Constants (make sure these are Python ints for good XLA specialization)
-                    tile_mult = config["ENT_GRID_H"] * config["ENT_GRID_W"]
-                    tile_out  = config["ENT_TILE_OUT"]
-                    rest_out  = config["ENT_REST_OUT"]
-                    B         = latent_obs.shape[0]
-
-                    # --- map activations to bin indices (B, L) ---
-                    z = jnp.round(latent_obs / bin_width).astype(jnp.int32) + nbins // 10
-                    z = jnp.clip(z, 0, nbins - 1)  # (B, L)
-
-                    # --- split into tiles and rest ---
-                    z_tile = z[:, :tile_out * tile_mult].reshape(B, tile_mult, tile_out)   # (B, 63, T)
-                    z_rest = z[:, tile_out * tile_mult:]                                   # (B, R)
-
-                    # --- current shared histogram (L2, K) ---
-                    counts = ex_state["latent_histogram"]          # (tile_out + rest_out, K)
-                    counts_tile = counts[:tile_out, :]             # (T, K)
-                    counts_rest = counts[tile_out:, :]             # (R, K)
-
-                    # --- log-density BEFORE updating (avoid bias) ---
-                    def _logp(c):  # c: (*, K)
-                        return jnp.log(c + min_count) - jnp.log(jnp.sum(c, axis=-1, keepdims=True) + min_count * nbins)
-
-                    log_p_tile = _logp(counts_tile)  # (T, K)
-                    log_p_rest = _logp(counts_rest)  # (R, K)
-
-                    # ===== Efficient gather for reward =====
-                    # Tiles: want log_p_tile[t, z_tile[b, s, t]] -> (B, 63, T)
-                    def gather_tile_per_t(logp_t, z_t):           # (K,), (B, 63)
-                        return jnp.take(logp_t, z_t, axis=0)      # -> (B, 63)
-
-                    log_p_sel_tile = jax.vmap(gather_tile_per_t, in_axes=(0, 2), out_axes=2)(
-                        log_p_tile, z_tile
-                    )  # (B, 63, T)
-
-                    # Rest: want log_p_rest[r, z_rest[b, r]] -> (B, R)
-                    z_rest_T = jnp.swapaxes(z_rest, 0, 1)  # (R, B)
-
-                    def gather_rest_per_r(logp_r, z_r):    # (K,), (B,)
-                        return jnp.take(logp_r, z_r, axis=0)  # -> (B,)
-
-                    log_p_sel_rest = jax.vmap(gather_rest_per_r, in_axes=(0, 0), out_axes=1)(
-                        log_p_rest, z_rest_T
-                    )  # (B, R)
-
-                    # Intrinsic reward (B,)
-                    sum_tile = jnp.sum(log_p_sel_tile, axis=(1, 2))  # sum over 63 and T
-                    sum_rest = jnp.sum(log_p_sel_rest, axis=1)       # sum over R
-                    reward_i = -(sum_tile + sum_rest) * ent_scale
-
-                    # ===== One-shot bincount updates (no vmapped small bincounts) =====
-                    # Edge suppression mask applied after reshape to (., K)
-                    # Tiles: for each feature t, aggregate counts over all (B * 63) indices
-                    # z_tile: (B, 63, T) -> flatten first two dims
-                    z_tile_flat = z_tile.reshape(-1, z_tile.shape[-1])    # (B*63, T)
-                    # Offsets so each feature t accumulates into its own block of K bins
-                    t_idx = jnp.arange(tile_out, dtype=jnp.int32)         # (T,)
-                    tile_offsets = t_idx * nbins                           # (T,)
-                    # Broadcast-add offsets across last axis
-                    z_tile_off = z_tile_flat + tile_offsets                # (B*63, T)
-                    # Single bincount over all features at once
-                    incr_tile_all = jnp.bincount(
-                        z_tile_off.reshape(-1),
-                        length=tile_out * nbins
-                    ).astype(jnp.float32)                                  # (T*K,)
-                    incr_tile = incr_tile_all.reshape(tile_out, nbins)     # (T, K)
-                    # Edge suppression
-                    incr_tile = incr_tile.at[:, 0].set(0.0).at[:, nbins - 1].set(0.0)
-
-                    # Rest: for each rest feature r, aggregate over batch
-                    if rest_out:
-                        r_idx = jnp.arange(rest_out, dtype=jnp.int32)      # (R,)
-                        rest_offsets = r_idx * nbins
-                        z_rest_off = z_rest + rest_offsets                 # (B, R)
-                        incr_rest_all = jnp.bincount(
-                            z_rest_off.reshape(-1),
-                            length=rest_out * nbins
-                        ).astype(jnp.float32)                               # (R*K,)
-                        incr_rest = incr_rest_all.reshape(rest_out, nbins)  # (R, K)
-                        incr_rest = incr_rest.at[:, 0].set(0.0).at[:, nbins - 1].set(0.0)
                     else:
-                        incr_rest = counts_rest * 0.0  # keep shape (0, K) if R=0
+                        # Slow, convolutional/tiled aggregation histogram
 
-                    # Apply decay once to the shared histogram
-                    new_counts_tile = counts_tile * decay + incr_tile      # (T, K)
-                    new_counts_rest = counts_rest * decay + incr_rest      # (R, K)
-                    new_counts = jnp.concatenate([new_counts_tile, new_counts_rest], axis=0)  # (T+R, K)
+                        # Shapes:
+                        # latent_obs: (B, L) where L = tile_out * 63 + rest_out
+                        # counts/ex_state["latent_histogram"]: (L2, K) where L2 = tile_out + rest_out
 
-                    # Write back
-                    ex_state["latent_histogram"] = new_counts
+                        # Constants (make sure these are Python ints for good XLA specialization)
+                        tile_mult = config["ENT_GRID_H"] * config["ENT_GRID_W"]
+                        tile_out  = config["ENT_TILE_OUT"]
+                        rest_out  = config["ENT_REST_OUT"]
+                        B         = latent_obs.shape[0]
 
+                        # --- map activations to bin indices (B, L) ---
+                        offset = nbins // 2 if config["ACTIVATION"] == "tanh" else nbins // 10
+                        z = jnp.round(latent_obs / bin_width).astype(jnp.int32) + offset
+                        z = jnp.clip(z, 0, nbins - 1)  # (B, L)
+
+                        # --- split into tiles and rest ---
+                        z_tile = z[:, :tile_out * tile_mult].reshape(B, tile_mult, tile_out)   # (B, 63, T)
+                        z_rest = z[:, tile_out * tile_mult:]                                   # (B, R)
+
+                        # --- current shared histogram (L2, K) ---
+                        counts = ex_state["latent_histogram"]          # (tile_out + rest_out, K)
+                        counts_tile = counts[:tile_out, :]             # (T, K)
+                        counts_rest = counts[tile_out:, :]             # (R, K)
+
+                        # --- log-density BEFORE updating (avoid bias) ---
+                        def _logp(c):  # c: (*, K)
+                            return jnp.log(c + min_count) - jnp.log(jnp.sum(c, axis=-1, keepdims=True) + min_count * nbins)
+
+                        log_p_tile = _logp(counts_tile)  # (T, K)
+                        log_p_rest = _logp(counts_rest)  # (R, K)
+
+                        # ===== Efficient gather for reward =====
+                        # Tiles: want log_p_tile[t, z_tile[b, s, t]] -> (B, 63, T)
+                        def gather_tile_per_t(logp_t, z_t):           # (K,), (B, 63)
+                            return jnp.take(logp_t, z_t, axis=0)      # -> (B, 63)
+
+                        log_p_sel_tile = jax.vmap(gather_tile_per_t, in_axes=(0, 2), out_axes=2)(log_p_tile, z_tile)  # (B, 63, T)
+
+                        # Rest: want log_p_rest[r, z_rest[b, r]] -> (B, R)
+                        z_rest_T = jnp.swapaxes(z_rest, 0, 1)  # (R, B)
+
+                        def gather_rest_per_r(logp_r, z_r):    # (K,), (B,)
+                            return jnp.take(logp_r, z_r, axis=0)  # -> (B,)
+
+                        log_p_sel_rest = jax.vmap(gather_rest_per_r, in_axes=(0, 0), out_axes=1)(log_p_rest, z_rest_T)  # (B, R)
+
+                        # Intrinsic reward (B,)
+                        sum_tile = jnp.sum(log_p_sel_tile, axis=(1, 2))  # sum over 63 and T
+                        sum_rest = jnp.sum(log_p_sel_rest, axis=1)       # sum over R
+                        reward_i = -(sum_tile + sum_rest) * ent_scale
+
+                        # ===== One-shot bincount updates (no vmapped small bincounts) =====
+                        # Edge suppression mask applied after reshape to (., K)
+                        # Tiles: for each feature t, aggregate counts over all (B * 63) indices
+                        # z_tile: (B, 63, T) -> flatten first two dims
+                        z_tile_flat = z_tile.reshape(-1, z_tile.shape[-1])    # (B*63, T)
+                        # Offsets so each feature t accumulates into its own block of K bins
+                        t_idx = jnp.arange(tile_out, dtype=jnp.int32)         # (T,)
+                        tile_offsets = t_idx * nbins                           # (T,)
+                        # Broadcast-add offsets across last axis
+                        z_tile_off = z_tile_flat + tile_offsets                # (B*63, T)
+                        # Single bincount over all features at once
+                        incr_tile_all = jnp.bincount(z_tile_off.reshape(-1), length=tile_out * nbins).astype(jnp.float32)     # (T*K,)
+                        incr_tile = incr_tile_all.reshape(tile_out, nbins)     # (T, K)
+                        # Edge suppression
+                        incr_tile = incr_tile.at[:, 0].set(0.0).at[:, nbins - 1].set(0.0)
+
+                        # Rest: for each rest feature r, aggregate over batch
+                        if rest_out:
+                            r_idx = jnp.arange(rest_out, dtype=jnp.int32)      # (R,)
+                            rest_offsets = r_idx * nbins
+                            z_rest_off = z_rest + rest_offsets                 # (B, R)
+                            incr_rest_all = jnp.bincount(z_rest_off.reshape(-1), length=rest_out * nbins).astype(jnp.float32) # (R*K,)
+                            incr_rest = incr_rest_all.reshape(rest_out, nbins)  # (R, K)
+                            incr_rest = incr_rest.at[:, 0].set(0.0).at[:, nbins - 1].set(0.0)
+                        else:
+                            incr_rest = counts_rest * 0.0  # keep shape (0, K) if R=0
+
+                        # Apply decay once to the shared histogram
+                        new_counts_tile = counts_tile * decay + incr_tile      # (T, K)
+                        new_counts_rest = counts_rest * decay + incr_rest      # (R, K)
+                        new_counts = jnp.concatenate([new_counts_tile, new_counts_rest], axis=0)  # (T+R, K)
+
+                        # Write back
+                        ex_state["latent_histogram"] = new_counts
 
                 if config['CONSTANT_REWARD'] > 0:
                     reward_i += config['CONSTANT_REWARD']
 
                 reward = reward_e + reward_i
 
-                transition = Transition(done=done, action=action, value_env=value_env, value_norm=value_norm, reward=reward, reward_i=reward_i, reward_e=reward_e, log_prob=log_prob,
-                    obs=last_obs, next_obs=obsv, info=info)
+                transition = Transition(done=done, action=action, value_env=value_env, value_norm=value_norm, reward=reward, reward_i=reward_i, reward_e=reward_e, log_prob=log_prob, obs=last_obs, next_obs=obsv, info=info)
                 runner_state = (train_state, env_state, obsv, ex_state, rng, update_step)
                 return runner_state, transition
 
@@ -489,8 +539,16 @@ def make_train(config):
 
             advantages, targets_env = _calculate_gae(traj_batch, last_val_env)
 
-            ex_state["ewma_return_norm"] = ewma_update(ex_state["ewma_return_norm"], targets_env)
+            ex_state["ewma_return_norm"] = ewma_update(ex_state["ewma_return_norm"], targets_env, weight=config["EWMA_RETURN_NORM_WEIGHT"])
             targets_norm = ewma_normalize(ex_state["ewma_return_norm"], targets_env)
+
+            # jax.debug.callback(
+            #     _log_action_and_value_stats_host,
+            #     traj_batch.action,      # shape: (NUM_STEPS, NUM_ENVS)
+            #     traj_batch.value_env,   # same shape
+            #     traj_batch.value_norm,  # same shape
+            #     update_step,            # scalar PPO update idx
+            # )
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -545,7 +603,7 @@ def make_train(config):
             update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config["UPDATE_EPOCHS"])
 
             train_state = update_state[0]
-            metric = jax.tree.map(lambda x: (x * traj_batch.info["returned_episode"]).sum() / traj_batch.info["returned_episode"].sum(), traj_batch.info)
+            metric = jax.tree.map(lambda x: (x * traj_batch.info["returned_episode"]).sum() / jnp.maximum(traj_batch.info["returned_episode"].sum(), 1), traj_batch.info)
 
             rng = update_state[-1]
 
@@ -553,9 +611,12 @@ def make_train(config):
             def _update_ex_epoch(update_state, unused):
                 def _update_ex_minbatch(ex_state, traj_batch):
                     def _recon_loss_fn(ent_encoder_params, ent_decoder_params, traj_batch):
+                        # obs = traj_batch.obs
+                        # latent_obs = ex_state["ent_encoder"].apply_fn(ent_encoder_params, obs)
                         latent_obs = ex_state["ent_encoder"].apply_fn(ent_encoder_params, last_obs)
                         reconstruct_obs = ex_state["ent_decoder"].apply_fn(ent_decoder_params, latent_obs)
 
+                        # error = (obs - reconstruct_obs)
                         error = (last_obs - reconstruct_obs)
                         mse = jnp.square(error).mean(axis=-1)
                         return jnp.mean(mse)
@@ -732,7 +793,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_timesteps", type=lambda x: int(float(x)), default=1e9)  # Allow scientific notation
     parser.add_argument("--num_envs", type=int, default=1024) # //4  # Just dividing by 4 here was worse (no other corrections)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=True)
+    # parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_steps", type=int, default=64) #  # Just dividing by 4 here was worse (no other corrections)
     parser.add_argument("--update_epochs", type=int, default=4)
     # parser.add_argument("--supervised", action=argparse.BooleanOptionalAction, default=True)
@@ -741,20 +802,21 @@ if __name__ == "__main__":
     parser.add_argument("--env_name", type=str, default="Craftax-Classic-Symbolic-v1")
     # parser.add_argument("--total_timesteps", type=lambda x: int(float(x)), default=1e6)  # Allow scientific notation
     # parser.add_argument("--num_envs", type=int, default=8)
-    # parser.add_argument("--lr", type=float, default=0.2e-4)
-    # parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=False)
+    # parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--anneal_lr", action=argparse.BooleanOptionalAction, default=False)
     # parser.add_argument("--num_steps", type=int, default=512)
     # parser.add_argument("--update_epochs", type=int, default=3)
     parser.add_argument("--supervised", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--num_minibatches", type=int, default=8)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.8) # * 0 + 0.99)
+    parser.add_argument("--gamma", type=float, default=0.99                )#*0 + 0.95)
+    parser.add_argument("--gae_lambda", type=float, default=0.8            )#*0 + 0.65) # * 0 + 0.99)
     parser.add_argument("--clip_eps", type=float, default=0.2)
-    parser.add_argument("--ent_coef", type=float, default=0.01)
-    parser.add_argument("--vf_coef", type=float, default=0.5)
+    parser.add_argument("--ent_coef", type=float, default=0.01             )#*0 + 0.05)
+    parser.add_argument("--vf_coef", type=float, default=0.5               )#*0 + 0.25)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    # parser.add_argument("--activation", type=str, default="tanh")  # Not used
+    parser.add_argument("--activation", type=str, default="relog")
+    # parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--jit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int)
@@ -765,14 +827,18 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_entity", type=str)
     parser.add_argument("--use_optimistic_resets", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--optimistic_reset_ratio", type=int, default=16)
+    # parser.add_argument("--skip_training_actor_steps", type=int, default=100)
+
+    parser.add_argument("--ewma_return_norm_weight", type=float, default=0.9)
 
     # EXPLORATION
     parser.add_argument("--exploration_update_epochs", type=int, default=4)
     # ENT
-    parser.add_argument("--ent_reward_coeff", type=float, default=1e-2)
+    parser.add_argument("--ent_reward_coeff", type=float, default=1e-4)
+    # parser.add_argument("--ent_reward_scale_ramp_steps", type=int, default=1)
     parser.add_argument("--ent_lr", type=float, default=1.5e-3)
     parser.add_argument("--ent_layer_size", type=int, default=256)  # 256 did better than 128
-    parser.add_argument("--ent_num_layers", type=int, default=3)  # Might need 6 for better results?
+    parser.add_argument("--ent_num_layers", type=int, default=6)  # Might need 6 for better results?
     # Classic
     parser.add_argument("--ent_tile_in", type=int, default=21)
     parser.add_argument("--ent_tile_out", type=int, default=16)
@@ -785,7 +851,7 @@ if __name__ == "__main__":
     # parser.add_argument("--ent_grid_w", type=int, default=11)
     parser.add_argument("--ent_rest_out", type=int, default=32)
     parser.add_argument("--ent_histogram_bins", type=int, default=151)
-    parser.add_argument("--ent_bin_width", type=float, default=0.01)
+    parser.add_argument("--ent_bin_width", type=float, default=0.03)
     parser.add_argument("--ent_min_count", type=float, default=0.01)
     parser.add_argument("--ent_decay", type=float, default=0.99)
 

@@ -1,5 +1,7 @@
 import jax.numpy as jnp
 import flax.linen as nn
+import numpy as np
+from flax.linen.initializers import constant, orthogonal
 
 from models.alt_activations import get_activation
 
@@ -14,9 +16,17 @@ class MLP(nn.Module):
     @nn.compact
     def __call__(self, x):
         act = get_activation(self.activation)
-        for _ in range(self.num_layers):
-            x = nn.Dense(self.hidden_size)(x)
+        skip_x = None
+        for i in range(self.num_layers):
+            x = nn.Dense(self.hidden_size,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0)
+            )(x)
             x = act(x)
+            if i % 2 == 0:
+                if skip_x is not None:
+                    x = x + skip_x
+                skip_x = x
         x = nn.Dense(self.out_dim)(x)
         if self.final_activation:
             x = act(x)
@@ -26,7 +36,7 @@ class MLP(nn.Module):
 class ENTEncoderTiled(nn.Module):
     layer_size: int
     num_layers: int
-    activation: str = "relog"
+    activation: str
 
     grid_h: int = 7 # Classic
     grid_w: int = 9
@@ -63,7 +73,7 @@ class ENTDecoderTiled(nn.Module):
     layer_size: int
     num_layers: int
     output_dim: int
-    activation: str = "relog"
+    activation: str
 
     grid_h: int = 7
     grid_w: int = 9
